@@ -110,7 +110,7 @@
                     <div class="bar-row">
                         <span class="bar-name">{{ label }}</span>
                         <div class="bar-track">
-                            <div class="bar-fill bar-{{ label | lower | replace(' ', '-') | replace('-2', '') }}"
+                            <div class="bar-fill bar-{{ label | lower | replace(' ', '-') }}"
                                  data-width="{{ (count / total_windows * 100) | round(1) }}"
                                  style="width: 0%;">
                             </div>
@@ -126,7 +126,7 @@
                 <p class="timeline-info">Each block = one {{ window_sec }}s window. Hover for details.</p>
                 <div class="timeline-track">
                     {% for i in range(predictions | length) %}
-                    <div class="tl-block tl-{{ label_names[i] | lower | replace(' ', '-') | replace('-2', '') }}"
+                    <div class="tl-block tl-{{ label_names[i] | lower | replace(' ', '-') }}"
                          data-tip="Window {{ i+1 }}: {{ label_names[i] }}"></div>
                     {% endfor %}
                 </div>

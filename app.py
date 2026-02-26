@@ -57,20 +57,31 @@ def _stress_level_info(ratio: float) -> dict:
 
 def _build_result_context(subject_id: str, method: str, results: dict) -> dict:
     """Build the full template context dict for result.html."""
+    # Only keep valid WESAD labels (filter out Unknown / legacy labels like Meditation-2)
+    valid_labels = {"Transient", "Baseline", "Stress", "Amusement", "Meditation"}
+
+    # Filter predictions + label_names in sync so timeline/table/chart stay consistent
+    filtered_preds = []
+    filtered_names = []
+    for pred, name in zip(results["predictions"], results["label_names"]):
+        if name in valid_labels:
+            filtered_preds.append(pred)
+            filtered_names.append(name)
+
     label_counts = {}
-    for name in results["label_names"]:
+    for name in filtered_names:
         label_counts[name] = label_counts.get(name, 0) + 1
 
     level_info = _stress_level_info(results["stress_ratio"])
     return {
         "subject_id": subject_id,
         "method": method,
-        "total_windows": len(results["predictions"]),
+        "total_windows": len(filtered_preds),
         "label_counts": label_counts,
         "stress_ratio": results["stress_ratio"],
         "overall_stress": results["stress_ratio"] > 0.30,
-        "predictions": results["predictions"],
-        "label_names": results["label_names"],
+        "predictions": filtered_preds,
+        "label_names": filtered_names,
         "window_sec": DEFAULT_WINDOW_SEC,
         **level_info,
     }
@@ -186,15 +197,25 @@ def manual():
     """Handle manual sensor value input."""
     subject_id = request.form.get("subject_id", "").strip()
     if not subject_id:
-        flash("Please enter a Subject ID.", "danger")
+        flash("Please select a model.", "danger")
         return redirect(url_for("index"))
 
+    # Allow the user to pick any available model
     if not model_exists(subject_id):
-        flash(
-            f"No trained model found for subject '{subject_id}'. "
-            "Please upload a .pkl file first to train a model.",
-            "danger",
-        )
+        available = _available_subjects()
+        if available:
+            flash(
+                f"No model for '{subject_id}'. "
+                f"Available models: {', '.join(available)}. "
+                "Please select one from the dropdown.",
+                "danger",
+            )
+        else:
+            flash(
+                "No trained models found. "
+                "Please upload a WESAD .pkl file first to train a model.",
+                "danger",
+            )
         return redirect(url_for("index"))
 
     sensor_values = {}
@@ -209,7 +230,7 @@ def manual():
     model, scaler = load_model(subject_id)
     results = predict(model, scaler, X)
 
-    ctx = _build_result_context(subject_id, "pre-trained", results)
+    ctx = _build_result_context(f"Manual (model: {subject_id})", "pre-trained", results)
     return render_template("result.html", **ctx)
 
 

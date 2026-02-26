@@ -102,14 +102,30 @@
                 </div>
                 <div>
                     <h2>Manual Sensor Input</h2>
-                    <p class="card-desc">Enter average sensor readings for a single observation. A trained model for that subject must already exist.</p>
+                    <p class="card-desc">Enter your own sensor readings. Pick any available trained model to classify them &mdash; your data does not need to be from the WESAD dataset.</p>
                 </div>
             </div>
 
+            {% if subjects %}
+            <div class="info-banner">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                <span>The model was trained on WESAD data, so predictions on external sensor data are <strong>approximate estimates</strong>.</span>
+            </div>
+            {% endif %}
+
             <form action="{{ url_for('manual') }}" method="post" id="manualForm">
                 <div class="form-group subject-group">
-                    <label for="subject_id">Subject ID</label>
-                    <input type="text" id="subject_id" name="subject_id" placeholder="e.g. S2" required autocomplete="off">
+                    <label for="subject_id">Use Model</label>
+                    {% if subjects %}
+                    <select id="subject_id" name="subject_id" required>
+                        <option value="" disabled selected>Select a trained model&hellip;</option>
+                        {% for sid in subjects %}
+                        <option value="{{ sid }}">{{ sid }}</option>
+                        {% endfor %}
+                    </select>
+                    {% else %}
+                    <input type="text" id="subject_id" name="subject_id" placeholder="No models available — upload a .pkl first" disabled>
+                    {% endif %}
                 </div>
 
                 <div class="sensor-section">
@@ -163,7 +179,7 @@
             </div>
             <div class="label-grid">
                 {% for key, val in label_map.items() %}
-                <div class="label-chip lc-{{ val | lower | replace(' ', '-') | replace('-2', '') }}">
+                <div class="label-chip lc-{{ val | lower | replace(' ', '-') }}">
                     <span class="label-key">{{ key }}</span>
                     <span class="label-val">{{ val }}</span>
                     {% if key == 2 %}<span class="badge stress">Stress</span>{% endif %}

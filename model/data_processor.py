@@ -100,8 +100,9 @@ def load_subject(pkl_path):
     with open(pkl_path, "rb") as fh:
         data = pickle.load(fh, encoding="latin1")
 
-    # Replace label 7 with 5 (as done in the notebook)
-    data["label"][data["label"] == 7] = 5
+    # Keep only valid WESAD labels (0-4); drop any non-standard ones
+    # (e.g. label 7 = "not defined" in some subjects)
+    valid_mask = np.isin(data["label"], [0, 1, 2, 3, 4])
 
     chest_df = extract_chest_data(data["signal"]["chest"])
     wrist_df = extract_wrist_data(data["signal"]["wrist"], target_len=len(chest_df))
@@ -112,5 +113,10 @@ def load_subject(pkl_path):
     )
     features = np.nan_to_num(combined.to_numpy(dtype=np.float32), nan=0.0)
     labels = data["label"][:len(chest_df)].astype(np.int64)
+
+    # Apply valid-label mask so only labels 0–4 survive
+    mask = valid_mask[:len(chest_df)]
+    features = features[mask]
+    labels = labels[mask]
 
     return features, labels

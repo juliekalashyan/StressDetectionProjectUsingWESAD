@@ -23,7 +23,6 @@ LABEL_MAP: dict[int, str] = {
     2: "Stress",
     3: "Amusement",
     4: "Meditation",
-    5: "Meditation-2",
 }
 
 # Labels that indicate stress

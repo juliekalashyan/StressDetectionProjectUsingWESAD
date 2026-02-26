@@ -146,7 +146,7 @@ browser.
 3. Click **Upload & Analyse**.
 4. Wait while the system:
    * extracts chest and wrist sensor data,
-   * computes 56 window-level features,
+   * computes 112 window-level features,
    * trains a model (if one hasn't been trained yet) or loads an existing
      model,
    * classifies every 5-second window.
@@ -196,8 +196,8 @@ stress-detection/
 | File | What it does |
 |------|-------------|
 | `app.py` | Defines three Flask routes: `/` (home page), `/upload` (file upload + prediction), `/manual` (manual input prediction). On upload it loads the `.pkl` file, extracts features, trains or loads a model, and renders the results page. |
-| `model/data_processor.py` | `load_subject(pkl_path)` opens the `.pkl` file, extracts 8 chest channels and 6 wrist channels, up-samples the wrist signals to 700 Hz, concatenates everything into a (samples × 14) matrix and returns it together with the label array. |
-| `model/feature_extractor.py` | `extract_windows(features, labels)` splits the 700 Hz time-series into non-overlapping 5-second windows (3 500 samples each) and computes **mean, std, min, max** for every channel — producing 14 × 4 = **56 features** per window. A majority-vote assigns one label to each window. |
+| `model/data_processor.py` | `load_subject(pkl_path)` opens the `.pkl` file, extracts 8 chest channels and 6 wrist channels, resamples wrist signals to 700 Hz via linear interpolation, concatenates everything into a (samples × 14) matrix, filters out non-standard labels, and returns the feature matrix together with the label array. |
+| `model/feature_extractor.py` | `extract_windows(features, labels)` splits the 700 Hz time-series into non-overlapping 5-second windows (3 500 samples each) and computes **mean, std, min, max, median, IQR, skewness, kurtosis** for every channel — producing 14 × 8 = **112 features** per window. A majority-vote assigns one label to each window. |
 | `model/predictor.py` | `predict(model, scaler, X)` scales the features, runs the Random Forest, and returns predictions, human-readable label names, per-window stress flags, and the overall stress ratio. |
 | `train_model.py` | Standalone script. Loads a subject, extracts windows, trains a `RandomForestClassifier` (200 trees, max depth 20, balanced class weights), prints a classification report, and saves the model + scaler to `trained_models/`. |
 
@@ -216,8 +216,8 @@ stress-detection/
                      ┌──────────────────────────────────────────────┐
                      │         feature_extractor.py                 │
                      │  Split into 5-second windows (3 500 samples) │
-                     │  Compute mean, std, min, max per channel     │
-                     │  → 56 features per window                    │
+                     │  Compute 8 statistics per channel             │
+                     │  → 112 features per window                   │
                      │  Majority-vote label per window.              │
                      └─────────────────────┬────────────────────────┘
                                            │
@@ -246,18 +246,19 @@ stress-detection/
    Acc X/Y/Z, ECG, EMG, EDA, Temp, Resp.
 
 3. **Extract wrist data** — 6 channels originally sampled at 4–64 Hz are
-   up-sampled to 700 Hz by inserting NaN values between real samples, then
-   NaNs are filled with zeros.
+   resampled to 700 Hz using linear interpolation (`np.interp`).
 
-4. **Align** — both DataFrames are truncated to the shorter length and
-   concatenated into a single 14-column matrix.
+4. **Align** — chest and wrist DataFrames (now the same length) are
+   concatenated into a single 14-column matrix.  Samples with non-standard
+   labels (outside 0–4) are filtered out.
 
 5. **Window** — the matrix is split into non-overlapping windows of 5 seconds
    (5 × 700 = 3,500 rows each).
 
 6. **Feature computation** — for each window and each of the 14 channels,
-   four statistics are computed: **mean**, **standard deviation**,
-   **minimum**, and **maximum** → 14 × 4 = **56 features**.
+   eight statistics are computed: **mean**, **standard deviation**,
+   **minimum**, **maximum**, **median**, **IQR**, **skewness**, and
+   **kurtosis** → 14 × 8 = **112 features**.
 
 7. **Label assignment** — each window gets the majority non-transient label
    (transient label 0 is ignored during voting).
@@ -275,22 +276,22 @@ stress-detection/
 
 The 14 input features correspond to these sensor signals:
 
-| # | Column Name | Sensor | Device | Native Rate |
-|---|-------------|--------|--------|-------------|
-| 1 | Chest Acc X | Accelerometer X-axis | RespiBAN (chest) | 700 Hz |
-| 2 | Chest Acc Y | Accelerometer Y-axis | RespiBAN (chest) | 700 Hz |
-| 3 | Chest Acc Z | Accelerometer Z-axis | RespiBAN (chest) | 700 Hz |
-| 4 | Chest ECG | Electrocardiogram | RespiBAN (chest) | 700 Hz |
-| 5 | Chest EMG | Electromyogram | RespiBAN (chest) | 700 Hz |
-| 6 | Chest EDA | Electrodermal Activity | RespiBAN (chest) | 700 Hz |
-| 7 | Chest Temp | Skin Temperature | RespiBAN (chest) | 700 Hz |
-| 8 | Chest Resp | Respiration | RespiBAN (chest) | 700 Hz |
-| 9 | Wrist Acc X | Accelerometer X-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz |
-| 10 | Wrist Acc Y | Accelerometer Y-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz |
-| 11 | Wrist Acc Z | Accelerometer Z-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz |
-| 12 | Wrist BVP | Blood Volume Pulse | Empatica E4 (wrist) | 64 Hz → 700 Hz |
-| 13 | Wrist EDA | Electrodermal Activity | Empatica E4 (wrist) | 4 Hz → 700 Hz |
-| 14 | Wrist Temp | Skin Temperature | Empatica E4 (wrist) | 4 Hz → 700 Hz |
+| # | Column Name | Sensor | Device | Native Rate | Unit | Typical Range |
+|---|-------------|--------|--------|-------------|------|---------------|
+| 1 | Chest Acc X | Accelerometer X-axis | RespiBAN (chest) | 700 Hz | g | −3 to +3 |
+| 2 | Chest Acc Y | Accelerometer Y-axis | RespiBAN (chest) | 700 Hz | g | −3 to +3 |
+| 3 | Chest Acc Z | Accelerometer Z-axis | RespiBAN (chest) | 700 Hz | g | −3 to +3 |
+| 4 | Chest ECG | Electrocardiogram | RespiBAN (chest) | 700 Hz | mV | −1 to +2 |
+| 5 | Chest EMG | Electromyogram | RespiBAN (chest) | 700 Hz | mV | −0.5 to +0.5 |
+| 6 | Chest EDA | Electrodermal Activity | RespiBAN (chest) | 700 Hz | µS | 0 to 40 |
+| 7 | Chest Temp | Skin Temperature | RespiBAN (chest) | 700 Hz | °C | 30 to 40 |
+| 8 | Chest Resp | Respiration | RespiBAN (chest) | 700 Hz | a.u. | −3 to +3 |
+| 9 | Wrist Acc X | Accelerometer X-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz | g | −3 to +3 |
+| 10 | Wrist Acc Y | Accelerometer Y-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz | g | −3 to +3 |
+| 11 | Wrist Acc Z | Accelerometer Z-axis | Empatica E4 (wrist) | 32 Hz → 700 Hz | g | −3 to +3 |
+| 12 | Wrist BVP | Blood Volume Pulse | Empatica E4 (wrist) | 64 Hz → 700 Hz | a.u. | −200 to +200 |
+| 13 | Wrist EDA | Electrodermal Activity | Empatica E4 (wrist) | 4 Hz → 700 Hz | µS | 0 to 5 |
+| 14 | Wrist Temp | Skin Temperature | Empatica E4 (wrist) | 4 Hz → 700 Hz | °C | 28 to 40 |
 
 ---
 
@@ -351,7 +352,7 @@ The test suite includes:
 | `test_extract_chest_data_shape` | Chest data extraction produces (n, 8) DataFrame |
 | `test_compute_window_features` | Window feature vector has correct shape and values |
 | `test_extract_windows_basic` | Window segmentation produces correct number of windows |
-| `test_features_from_manual_input` | Manual input builds a valid (1, 56) feature vector |
+| `test_features_from_manual_input` | Manual input builds a valid (1, 112) feature vector |
 | `test_label_map_contains_stress` | Label map correctly maps 2 → "Stress" |
 | `test_flask_index` | Home page loads (HTTP 200) |
 | `test_flask_upload_no_file` | Upload without file shows error message |
