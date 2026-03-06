@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WESAD Stress Detection</title>
+    <meta name="description" content="Detect human stress levels from WESAD wearable sensor data using six machine learning classifiers.">
+    <meta name="theme-color" content="#0f0e17">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC" crossorigin="anonymous"></script>
+</head>
+<body>
+    <!-- Top progress bar -->
+    <div class="progress-bar" id="progressBar"></div>
+
+    <!-- Animated background orbs -->
+    <div class="bg-orbs" aria-hidden="true">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+        <div class="orb orb-4"></div>
+    </div>
+
+    <div class="container">
+
+        <!-- ============================================================
+             PAGE: HOME
+             ============================================================ -->
+        <div id="page-home">
+            <!-- Hero Header -->
+            <header class="hero animate-in">
+                <div class="hero-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="url(#hgrad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <defs><linearGradient id="hgrad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:#a78bfa"/><stop offset="100%" style="stop-color:#34d399"/></linearGradient></defs>
+                        <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                    </svg>
+                </div>
+                <h1>WESAD Stress Detection</h1>
+                <p class="subtitle">Upload a WESAD subject <code>.pkl</code> file or enter sensor readings manually to detect stress levels using machine learning.</p>
+            </header>
+
+            <!-- Flash / Error messages (JS fills) -->
+            <div id="alertBox" class="flash-messages" style="display:none;"></div>
+
+            <!-- WESAD Label Info -->
+            <section class="card info-card animate-in" id="labelInfoSection">
+                <div class="card-header">
+                    <div class="card-icon icon-blue">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    </div>
+                    <div>
+                        <h2>About WESAD Labels</h2>
+                        <p class="card-desc">Understanding the dataset label categories</p>
+                    </div>
+                </div>
+                <div class="label-grid" id="labelGrid"></div>
+            </section>
+
+            <!-- Upload Section -->
+            <section class="card animate-in" id="uploadSection">
+                <div class="card-header">
+                    <div class="card-icon icon-purple">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    </div>
+                    <div>
+                        <h2>Upload Subject File</h2>
+                        <p class="card-desc">Upload a <code>.pkl</code> file from the WESAD dataset (e.g. S2.pkl, S3.pkl). The system extracts sensor data, computes features, and predicts stress for each time window.</p>
+                    </div>
+                </div>
+                <div id="modelsInfoBanner" class="info-banner" style="display:none;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    <span>Pre-trained models available for: <strong id="modelsListText"></strong></span>
+                </div>
+                <form id="uploadForm">
+                    <div class="drop-zone" id="dropZone" tabindex="0" role="button" aria-label="Click or drag to upload a .pkl file">
+                        <input type="file" id="pkl_file" name="pkl_file" accept=".pkl" class="drop-zone-input">
+                        <div class="drop-zone-prompt" id="dropPrompt">
+                            <div class="drop-zone-icon">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></svg>
+                            </div>
+                            <p class="drop-zone-text"><strong>Click to browse</strong> or drag &amp; drop</p>
+                            <p class="drop-zone-hint">Accepts .pkl files up to 2 GB</p>
+                        </div>
+                        <div class="drop-zone-selected" id="dropSelected" style="display:none;">
+                            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                            <span class="file-name-text" id="fileNameText"></span>
+                            <button type="button" class="drop-zone-clear" id="clearFile" title="Remove file">&times;</button>
+                        </div>
+                    </div>
+                    <div class="btn-row">
+                        <button type="submit" class="btn btn-primary btn-full" id="uploadBtn" data-action="upload">
+                            <svg class="btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+                            <span class="btn-label">Upload &amp; Analyse</span>
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                        </button>
+                        <button type="button" class="btn btn-secondary btn-full" id="compareBtn">
+                            <svg class="btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="12" width="4" height="9"/><rect x="10" y="7" width="4" height="14"/><rect x="17" y="2" width="4" height="19"/></svg>
+                            <span class="btn-label">Compare 6 ML Models</span>
+                            <span class="btn-spinner" aria-hidden="true"></span>
+                        </button>
+                    </div>
+                </form>
+            </section>
+
+            <!-- Manual Input Section -->
+            <section class="card animate-in" id="manualSection">
+                <div class="card-header">
+                    <div class="card-icon icon-green">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                    </div>
+                    <div>
+                        <h2>Manual Sensor Input</h2>
+                        <p class="card-desc">Enter sensor readings to predict stress level. Uses a <strong>general model</strong> trained on all WESAD subjects &mdash; no subject selection needed.</p>
+                    </div>
+                </div>
+                <div id="manualInfoBanner" class="info-banner" style="display:none;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    <span>The general model is trained on data from <strong>all WESAD subjects</strong>, so it works for anyone. You can optionally override with a subject-specific model below.</span>
+                </div>
+                <form id="manualForm">
+                    <div class="form-group subject-group">
+                        <label for="subject_id">Model <small style="opacity:0.6;">(optional override)</small></label>
+                        <select id="subject_id" name="subject_id">
+                            <option value="" selected>Loading models&hellip;</option>
+                        </select>
+                    </div>
+                    <!-- Quick-fill presets -->
+                    <div class="preset-bar">
+                        <span class="preset-label">Quick fill:</span>
+                        <button type="button" class="preset-btn preset-low" data-preset="low">
+                            <span class="preset-dot dot-low"></span> Low Stress
+                        </button>
+                        <button type="button" class="preset-btn preset-high" data-preset="high">
+                            <span class="preset-dot dot-high"></span> High Stress
+                        </button>
+                        <button type="button" class="preset-btn preset-critical" data-preset="critical">
+                            <span class="preset-dot dot-critical"></span> Critical Stress
+                        </button>
+                        <button type="button" class="preset-btn preset-clear" data-preset="clear">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            Clear All
+                        </button>
+                    </div>
+                    <div class="sensor-section">
+                        <h3>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+                            Chest Sensors
+                        </h3>
+                        <div class="sensor-grid" id="chestGrid"></div>
+                    </div>
+                    <div class="sensor-section">
+                        <h3>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+                            Wrist Sensors
+                        </h3>
+                        <div class="sensor-grid" id="wristGrid"></div>
+                    </div>
+                    <button type="submit" class="btn btn-secondary btn-full" id="manualBtn">
+                        <svg class="btn-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                        <span class="btn-label">Predict Stress Level</span>
+                        <span class="btn-spinner" aria-hidden="true"></span>
+                    </button>
+                </form>
+            </section>
+
+            <footer class="footer animate-in">
+                <p>WESAD Stress Detection &middot; Machine Learning Pipeline</p>
+                <div class="footer-links">
+                    <a href="https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection" target="_blank" rel="noopener">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                        WESAD Dataset
+                    </a>
+                    <span style="color:var(--text-dim);">&copy; 2026</span>
+                </div>
+            </footer>
+        </div>
+
+        <!-- ============================================================
+             PAGE: RESULT  (hidden by default, JS populates)
+             ============================================================ -->
+        <div id="page-result" style="display:none;" aria-live="polite"></div>
+
+        <!-- ============================================================
+             PAGE: COMPARE  (hidden by default, JS populates)
+             ============================================================ -->
+        <div id="page-compare" style="display:none;" aria-live="polite"></div>
+
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

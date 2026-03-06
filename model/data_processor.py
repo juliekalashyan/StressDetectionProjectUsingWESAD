@@ -94,15 +94,39 @@ def load_subject(pkl_path):
     -------
     features : np.ndarray of shape (n_samples, 14)
     labels : np.ndarray of shape (n_samples,)
+
+    Raises
+    ------
+    ValueError
+        If the .pkl file does not contain the expected WESAD structure.
     """
-    
 
     with open(pkl_path, "rb") as fh:
         data = pickle.load(fh, encoding="latin1")
 
-    # Keep only valid WESAD labels (0-4); drop any non-standard ones
-    # (e.g. label 7 = "not defined" in some subjects)
-    valid_mask = np.isin(data["label"], [0, 1, 2, 3, 4])
+    # Validate expected WESAD structure
+    if not isinstance(data, dict):
+        raise ValueError("Invalid .pkl file: expected a dictionary at the top level.")
+    for key in ("signal", "label"):
+        if key not in data:
+            raise ValueError(f"Invalid .pkl file: missing required key '{key}'.")
+    if not isinstance(data["signal"], dict):
+        raise ValueError("Invalid .pkl file: 'signal' must be a dictionary.")
+    for sensor in ("chest", "wrist"):
+        if sensor not in data["signal"]:
+            raise ValueError(f"Invalid .pkl file: missing 'signal/{sensor}' data.")
+    chest_sig = data["signal"]["chest"]
+    for key in ("ACC", "ECG", "EMG", "EDA", "Temp", "Resp"):
+        if key not in chest_sig:
+            raise ValueError(f"Invalid .pkl file: missing chest sensor '{key}'.")
+    wrist_sig = data["signal"]["wrist"]
+    for key in ("ACC", "BVP", "EDA", "TEMP"):
+        if key not in wrist_sig:
+            raise ValueError(f"Invalid .pkl file: missing wrist sensor '{key}'.")
+
+    # Keep only meaningful WESAD labels (1=Baseline, 2=Stress, 3=Amusement).
+    # Label 0 (Transient) is a protocol artefact, not a real physiological state.
+    valid_mask = np.isin(data["label"], [1, 2, 3])
 
     chest_df = extract_chest_data(data["signal"]["chest"])
     wrist_df = extract_wrist_data(data["signal"]["wrist"], target_len=len(chest_df))
@@ -114,7 +138,7 @@ def load_subject(pkl_path):
     features = np.nan_to_num(combined.to_numpy(dtype=np.float32), nan=0.0)
     labels = data["label"][:len(chest_df)].astype(np.int64)
 
-    # Apply valid-label mask so only labels 0–4 survive
+    # Apply valid-label mask so only labels 1–3 (Baseline/Stress/Amusement) survive
     mask = valid_mask[:len(chest_df)]
     features = features[mask]
     labels = labels[mask]
