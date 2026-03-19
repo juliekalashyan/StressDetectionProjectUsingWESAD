@@ -120,7 +120,7 @@ def main():
     parser.add_argument(
         "--compare",
         action="store_true",
-        help="Compare all 6 classifiers and print a ranking table",
+        help="Compare all classifiers and print a ranking table",
     )
     parser.add_argument(
         "--general",

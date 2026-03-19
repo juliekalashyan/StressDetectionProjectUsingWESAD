@@ -10,6 +10,10 @@ from .feature_extractor import LABEL_MAP, STRESS_LABELS, FEATURE_NAMES
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "trained_models")
 EXPECTED_N_FEATURES = len(FEATURE_NAMES)
 
+# Minimum feature count we'll still accept (older models trained before HRV
+# features were added).  Models with fewer features than this are truly stale.
+_MIN_ACCEPTED_FEATURES = 100
+
 
 def _model_path(subject_id):
     return os.path.join(MODEL_DIR, f"model_{subject_id}.joblib")
@@ -19,11 +23,35 @@ def _scaler_path(subject_id):
     return os.path.join(MODEL_DIR, f"scaler_{subject_id}.joblib")
 
 
+def _features_cache_path(subject_id):
+    return os.path.join(MODEL_DIR, f"features_{subject_id}.npz")
+
+
 def model_exists(subject_id):
     """Return True if a trained model exists for the given subject."""
     return os.path.isfile(_model_path(subject_id)) and os.path.isfile(
         _scaler_path(subject_id)
     )
+
+
+def features_cache_exists(subject_id):
+    """Return True if cached features exist for the given subject."""
+    return os.path.isfile(_features_cache_path(subject_id))
+
+
+def save_features_cache(subject_id, X, y):
+    """Save extracted features to disk so future uploads skip feature extraction."""
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    np.savez_compressed(_features_cache_path(subject_id), X=X, y=y)
+
+
+def load_features_cache(subject_id):
+    """Load cached features. Returns (X, y) or (None, None) if unavailable."""
+    path = _features_cache_path(subject_id)
+    if not os.path.isfile(path):
+        return None, None
+    data = np.load(path)
+    return data["X"], data["y"]
 
 
 from functools import lru_cache
@@ -32,7 +60,7 @@ from functools import lru_cache
 def invalidate_model_cache(subject_id: str) -> None:
     """Delete stale model files and clear the LRU cache for *subject_id*."""
     load_model.cache_clear()
-    for path in (_model_path(subject_id), _scaler_path(subject_id)):
+    for path in (_model_path(subject_id), _scaler_path(subject_id), _features_cache_path(subject_id)):
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -43,15 +71,17 @@ def invalidate_model_cache(subject_id: str) -> None:
 def load_model(subject_id):
     """Load and return (model, scaler) for a subject.
 
-    Returns (None, None) if the saved model is stale (wrong feature count).
+    Accepts models trained on fewer features than the current
+    EXPECTED_N_FEATURES (e.g. 154 vs 159) — the predict function
+    will truncate the feature matrix to match.  Only truly stale
+    models (< _MIN_ACCEPTED_FEATURES) are rejected.
     """
     model = joblib.load(_model_path(subject_id))
     scaler = joblib.load(_scaler_path(subject_id))
 
-    # Validate feature count so stale 112-feature models are rejected
     n_feat = _model_n_features(model, scaler)
-    if n_feat is not None and n_feat != EXPECTED_N_FEATURES:
-        return None, None  # caller will retrain
+    if n_feat is not None and n_feat < _MIN_ACCEPTED_FEATURES:
+        return None, None  # truly stale — caller will retrain
 
     return model, scaler
 
@@ -106,6 +136,12 @@ def predict(model, scaler, X):
         is_stressed : list[bool]
         stress_ratio : float  (fraction of windows predicted as Stress)
     """
+    # Auto-truncate features if the model was trained on fewer columns
+    # (e.g. 154-feature models vs current 159-feature extraction).
+    model_n = _model_n_features(model, scaler)
+    if model_n is not None and X.shape[1] > model_n:
+        X = X[:, :model_n]
+
     # model may be a full sklearn Pipeline (imputer+scaler+clf) or a plain
     # estimator paired with a separate scaler (legacy saved models).
     if scaler is None:

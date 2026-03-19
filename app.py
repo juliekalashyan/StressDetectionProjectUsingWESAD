@@ -12,9 +12,15 @@ Then open http://127.0.0.1:5000 in your browser.
 
 import os
 import tempfile
+import time
+import threading
+import csv
+import io
+import json
+from datetime import datetime, timezone
 
 import numpy as np
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 from werkzeug.utils import secure_filename
 
 from model.data_processor import load_subject, FEATURE_COLUMNS
@@ -28,6 +34,7 @@ from model.feature_extractor import (
 )
 from model.predictor import (
     model_exists, load_model, predict, invalidate_model_cache, load_manual_model,
+    features_cache_exists, save_features_cache, load_features_cache,
 )
 from model.trainer import (
     train_model,
@@ -41,19 +48,97 @@ from model.trainer import (
     CLASSIFIER_CATALOGUE,
 )
 
+import database as db
+
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024  # 2 GB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB (largest WESAD .pkl ~170 MB)
 
 UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "wesad_uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
+
+# ---------------------------------------------------------------------------
+# Simple in-memory rate limiter (per-IP, sliding window)
+# ---------------------------------------------------------------------------
+class _RateLimiter:
+    """Thread-safe sliding-window rate limiter keyed by IP."""
+
+    def __init__(self, max_requests: int = 10, window_sec: int = 60):
+        self._max = max_requests
+        self._window = window_sec
+        self._lock = threading.Lock()
+        self._requests: dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            history = self._requests.get(key, [])
+            # Prune entries outside the window
+            history = [t for t in history if now - t < self._window]
+            if len(history) >= self._max:
+                self._requests[key] = history
+                return False
+            history.append(now)
+            self._requests[key] = history
+            return True
+
+
+# 10 expensive requests (upload/compare/train) per minute per IP
+_rate_limiter = _RateLimiter(max_requests=10, window_sec=60)
+
+
+def _check_rate_limit():
+    """Return a 429 response if the client has exceeded the rate limit."""
+    ip = request.remote_addr or "unknown"
+    if not _rate_limiter.is_allowed(ip):
+        return jsonify({"error": "Too many requests. Please wait and try again."}), 429
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Comparison result cache (avoids re-training 6+ classifiers)
+# ---------------------------------------------------------------------------
+_compare_cache: dict[str, tuple[float, list]] = {}   # sid -> (timestamp, results)
+_COMPARE_CACHE_TTL = 3600  # 1 hour
+
+# Pre-computed prediction results — populated at startup for instant responses.
+_prediction_cache: dict[str, dict] = {}  # sid -> result dict
+
+
+def _get_cached_comparison(subject_id: str):
+    # 1. In-memory cache
+    entry = _compare_cache.get(subject_id)
+    if entry is not None:
+        ts, results = entry
+        if time.time() - ts <= _COMPARE_CACHE_TTL:
+            return results
+        del _compare_cache[subject_id]
+    # 2. Database
+    disk = db.load_comparison(subject_id)
+    if disk is not None:
+        _compare_cache[subject_id] = (time.time(), disk)
+        return disk
+    return None
+
+
+def _set_cached_comparison(subject_id: str, results: list):
+    _compare_cache[subject_id] = (time.time(), results)
+    db.save_comparison(subject_id, results)
+
+# Persistent directory for saved .pkl files the user wants to keep.
+SAVED_FILES_DIR = os.path.join(os.path.dirname(__file__), "saved_files")
+os.makedirs(SAVED_FILES_DIR, exist_ok=True)
+
 TRAINED_MODELS_DIR = os.path.join(os.path.dirname(__file__), "trained_models")
+
+# Initialise the SQLite database (creates tables if needed).
+db.init_db()
 
 # Path to WESAD dataset root (for training the general model).
 # Set env var WESAD_DATA_DIR to override.
@@ -155,6 +240,7 @@ def _build_result_dict(subject_id: str, method: str, results: dict,
     ctx = {
         "subject_id": subject_id,
         "method": method,
+        "captured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "total_windows": len(filtered_preds),
         "label_counts": label_counts,
         "stress_ratio": effective_ratio,
@@ -171,11 +257,14 @@ def _build_result_dict(subject_id: str, method: str, results: dict,
         ctx["f1_weighted"] = metrics.get("f1_weighted")
         ctx["precision"] = metrics.get("precision")
         ctx["recall"] = metrics.get("recall")
+        ctx["roc_auc"] = metrics.get("roc_auc")
         ctx["cv_mean"] = metrics.get("cv_mean")
         ctx["cv_std"] = metrics.get("cv_std")
         ctx["confusion_matrix"] = metrics.get("confusion_matrix", [])
         ctx["target_names"] = metrics.get("target_names", [])
         ctx["classifier_name"] = metrics.get("classifier_name", "Random Forest")
+        ctx["n_features_used"] = metrics.get("n_features_used")
+        ctx["feature_selection_applied"] = metrics.get("feature_selection_applied", False)
 
         importances = metrics.get("feature_importances")
         if importances:
@@ -187,6 +276,98 @@ def _build_result_dict(subject_id: str, method: str, results: dict,
             ctx["feature_importance_values"] = [round(p[1], 5) for p in pairs]
 
     return ctx
+
+
+# ---------------------------------------------------------------------------
+# Persistent results cache — survives server restarts
+# ---------------------------------------------------------------------------
+
+
+def _normalise_tracking_id(raw_tracking_id: str | None) -> str:
+    if raw_tracking_id is None:
+        return ""
+    return secure_filename(str(raw_tracking_id).strip())
+
+
+def _history_entry_from_result(tracking_id: str, result: dict) -> dict:
+    latest_label = result["label_names"][0] if result.get("label_names") else None
+    return {
+        "tracking_id": tracking_id,
+        "captured_at": result.get("captured_at"),
+        "subject_id": result.get("subject_id"),
+        "method": result.get("method"),
+        "is_manual": result.get("is_manual", False),
+        "stress_ratio": result.get("stress_ratio", 0.0),
+        "stress_level": result.get("stress_level"),
+        "overall_stress": result.get("overall_stress", False),
+        "predicted_label": latest_label,
+        "total_windows": result.get("total_windows", 0),
+        "label_counts": result.get("label_counts", {}),
+    }
+
+
+def _build_history_summary(entries: list[dict]) -> dict:
+    if not entries:
+        return {"count": 0, "latest": None, "previous": None, "delta": None, "trend": "stable"}
+
+    latest = entries[-1]
+    previous = entries[-2] if len(entries) > 1 else None
+    delta = None
+    trend = "stable"
+    if previous is not None:
+        delta = round(float(latest.get("stress_ratio", 0.0)) - float(previous.get("stress_ratio", 0.0)), 4)
+        if delta > 0.02:
+            trend = "up"
+        elif delta < -0.02:
+            trend = "down"
+
+    return {
+        "count": len(entries),
+        "latest": latest,
+        "previous": previous,
+        "delta": delta,
+        "trend": trend,
+    }
+
+
+def _append_history_entry(tracking_id: str, result: dict) -> dict:
+    entry = _history_entry_from_result(tracking_id, result)
+    db.append_history_entry(tracking_id, entry)
+    entries = db.load_history(tracking_id)
+    return _build_history_summary(entries)
+
+
+def _history_entries_to_csv(entries: list[dict]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "tracking_id",
+        "captured_at",
+        "subject_id",
+        "method",
+        "is_manual",
+        "stress_ratio",
+        "stress_level",
+        "overall_stress",
+        "predicted_label",
+        "total_windows",
+        "label_counts",
+    ])
+    for entry in entries:
+        writer.writerow([
+            entry.get("tracking_id", ""),
+            entry.get("captured_at", ""),
+            entry.get("subject_id", ""),
+            entry.get("method", ""),
+            entry.get("is_manual", False),
+            entry.get("stress_ratio", 0.0),
+            entry.get("stress_level", ""),
+            entry.get("overall_stress", False),
+            entry.get("predicted_label", ""),
+            entry.get("total_windows", 0),
+            json.dumps(entry.get("label_counts", {}), ensure_ascii=False),
+        ])
+    return buffer.getvalue()
 
 
 def _available_subjects():
@@ -234,6 +415,51 @@ def _ensure_general_model():
         logger.error("Failed to train general model: %s", exc)
 
 
+def _warmup_cache():
+    """Load saved results from disk into the in-memory prediction cache.
+
+    Also pre-compute results for subjects that have a model + feature cache
+    but no saved result yet (first startup after training).
+    Called once at server start so every click is instant.
+    """
+    # 1. Load all previously saved results from database
+    loaded = 0
+    for sid in db.list_result_ids():
+        if sid in _prediction_cache:
+            continue
+        result = db.load_result(sid)
+        if result is not None:
+            _prediction_cache[sid] = result
+            loaded += 1
+
+    # 2. Pre-compute for subjects that have model + features but no result yet
+    computed = 0
+    for sid in _available_subjects():
+        if sid in _prediction_cache:
+            continue
+        try:
+            if not model_exists(sid) or not features_cache_exists(sid):
+                continue
+            model, scaler = load_model(sid)
+            if model is None:
+                continue
+            X, y = load_features_cache(sid)
+            if X is None:
+                continue
+            results = predict(model, scaler, X)
+            ctx = _build_result_dict(sid, "pre-trained", results)
+            _prediction_cache[sid] = ctx
+            db.save_result(sid, ctx)
+            computed += 1
+        except Exception as exc:
+            logger.warning("Warmup compute failed for %s: %s", sid, exc)
+    logger.info(
+        "Warmup complete: %d loaded from disk, %d computed fresh. "
+        "%d total subjects ready.",
+        loaded, computed, len(_prediction_cache),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes – static SPA
 # ---------------------------------------------------------------------------
@@ -244,6 +470,24 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Lightweight health-check endpoint for monitoring."""
+    return jsonify({
+        "status": "ok",
+        "models_loaded": len(_prediction_cache),
+        "general_model_ready": general_model_exists() and general_manual_model_exists(),
+    })
+
+
+@app.after_request
+def add_cache_headers(response):
+    """Add cache-control headers to static assets."""
+    if request.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
 # ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
@@ -251,9 +495,18 @@ def index():
 @app.route("/api/config", methods=["GET"])
 def api_config():
     """Return front-end configuration: feature columns, models, labels, etc."""
+    subjects = _available_subjects()
+    subject_cache = {sid: features_cache_exists(sid) for sid in subjects}
+    # Subjects with saved results (superset of subjects with models)
+    result_subjects = sorted(
+        set(subjects) | set(_prediction_cache.keys()),
+        key=lambda s: [int(t) if t.isdigit() else t for t in __import__('re').split(r'(\d+)', s)],
+    )
     return jsonify({
         "feature_columns": FEATURE_COLUMNS,
-        "subjects": _available_subjects(),
+        "subjects": result_subjects,
+        "subject_cache": subject_cache,
+        "instant_subjects": list(_prediction_cache.keys()),
         "label_map": {str(k): v for k, v in LABEL_MAP.items()},
         "classifier_names": list(CLASSIFIER_CATALOGUE.keys()),
         "sensor_meta": SENSOR_META,
@@ -261,9 +514,22 @@ def api_config():
     })
 
 
+@app.route("/api/batch-results", methods=["GET"])
+def api_batch_results():
+    """Return all pre-computed prediction results in a single response.
+
+    The frontend calls this once on page load to enable instant
+    single-click analysis with zero latency.
+    """
+    return jsonify(_prediction_cache)
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     """Process a .pkl file upload and return prediction results as JSON."""
+    rl = _check_rate_limit()
+    if rl:
+        return rl
     file = request.files.get("pkl_file")
     if not file or file.filename == "":
         return jsonify({"error": "Please select a WESAD subject .pkl file."}), 400
@@ -274,21 +540,36 @@ def api_upload():
     safe_name = secure_filename(file.filename)
     if not safe_name:
         return jsonify({"error": "Invalid filename."}), 400
+    tracking_id = _normalise_tracking_id(request.form.get("tracking_id"))
+    if request.form.get("tracking_id") and not tracking_id:
+        return jsonify({"error": "tracking_id must contain at least one valid character."}), 400
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], safe_name)
     file.save(save_path)
     subject_id = os.path.splitext(safe_name)[0]
 
     try:
-        features, labels = load_subject(save_path)
-        X, y = extract_windows(features, labels)
-        np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-
         model, scaler, metrics = None, None, None
-        if model_exists(subject_id):
+        X, y = None, None
+
+        # Fast path: if a pre-trained model AND cached features exist,
+        # skip the expensive pickle-load + feature extraction entirely.
+        if model_exists(subject_id) and features_cache_exists(subject_id):
             model, scaler = load_model(subject_id)
-            if model is None:
-                invalidate_model_cache(subject_id)
-                model, scaler = None, None
+            if model is not None:
+                X, y = load_features_cache(subject_id)
+
+        # Slow path: need to extract features from the raw .pkl
+        if X is None:
+            features, labels = load_subject(save_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(subject_id, X, y)
+
+        if model is None:
+            if model_exists(subject_id):
+                model, scaler = load_model(subject_id)
+                if model is None:
+                    invalidate_model_cache(subject_id)
 
         if model is None:
             model, scaler, metrics = train_model(
@@ -296,10 +577,24 @@ def api_upload():
             )
             save_model(model, scaler, subject_id)
 
+        # Persist the .pkl so the user can re-analyse without uploading again.
+        saved_pkl = os.path.join(SAVED_FILES_DIR, safe_name)
+        if not os.path.exists(saved_pkl) and os.path.exists(save_path):
+            import shutil
+            shutil.copy2(save_path, saved_pkl)
+
         results = predict(model, scaler, X)
         method = "pre-trained" if metrics is None else "trained on-the-fly"
         ctx = _build_result_dict(subject_id, method, results, metrics=metrics)
-        return jsonify(ctx)
+        # Cache result in memory and persist to disk
+        _prediction_cache[subject_id] = ctx
+        db.save_result(subject_id, ctx)
+        response_ctx = dict(ctx)
+        if tracking_id:
+            history_summary = _append_history_entry(tracking_id, ctx)
+            response_ctx["tracking_id"] = tracking_id
+            response_ctx["history_length"] = history_summary["count"]
+        return jsonify(response_ctx)
 
     except Exception as exc:
         logger.exception("Error processing upload")
@@ -312,6 +607,9 @@ def api_upload():
 @app.route("/api/compare", methods=["POST"])
 def api_compare():
     """Train all classifiers on an uploaded .pkl and return comparison JSON."""
+    rl = _check_rate_limit()
+    if rl:
+        return rl
     file = request.files.get("pkl_file")
     if not file or file.filename == "":
         return jsonify({"error": "Please select a WESAD subject .pkl file."}), 400
@@ -327,11 +625,21 @@ def api_compare():
     subject_id = os.path.splitext(safe_name)[0]
 
     try:
-        features, labels = load_subject(save_path)
-        X, y = extract_windows(features, labels)
-        np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        # Check comparison cache first
+        cached = _get_cached_comparison(subject_id)
+        if cached is not None:
+            return jsonify({"subject_id": subject_id, "results": cached})
+
+        # Use cached features if available, otherwise extract from pkl
+        X, y = load_features_cache(subject_id)
+        if X is None:
+            features, labels = load_subject(save_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(subject_id, X, y)
 
         results = compare_classifiers(X, y, cv_folds=5, verbose=True)
+        _set_cached_comparison(subject_id, results)
         return jsonify({"subject_id": subject_id, "results": results})
 
     except Exception as exc:
@@ -368,7 +676,11 @@ def api_predict():
         return jsonify({"error": "Request body must be JSON."}), 400
 
     subject_id = data.get("subject_id", "").strip()
+    tracking_id = _normalise_tracking_id(data.get("tracking_id"))
     sensors = data.get("sensors", {})
+
+    if data.get("tracking_id") and not tracking_id:
+        return jsonify({"error": "tracking_id must contain at least one valid character."}), 400
 
     # Decide which model to use
     if subject_id:
@@ -399,7 +711,7 @@ def api_predict():
     # Choose the right model & feature vector.
     # When using the general model → use the compact means-only model that
     # was trained on just the 14 mean features per window.  This avoids the
-    # synthetic-feature problem (the full 154-feature model can't
+    # synthetic-feature problem (the full 159-feature model can't
     # meaningfully classify fabricated std/iqr/skew/freq values).
     if subject_id == GENERAL_ID:
         model, scaler = load_manual_model()
@@ -416,7 +728,12 @@ def api_predict():
     results = predict(model, scaler, X)
 
     ctx = _build_result_dict(model_label, "manual input", results)
-    return jsonify(ctx)
+    response_ctx = dict(ctx)
+    if tracking_id:
+        history_summary = _append_history_entry(tracking_id, ctx)
+        response_ctx["tracking_id"] = tracking_id
+        response_ctx["history_length"] = history_summary["count"]
+    return jsonify(response_ctx)
 
 
 @app.route("/api/models", methods=["GET"])
@@ -425,12 +742,321 @@ def api_models():
     return jsonify({"models": _available_subjects()})
 
 
+@app.route("/api/history/<tracking_id>", methods=["GET"])
+def api_history(tracking_id):
+    """Return the longitudinal history stored for a tracking ID."""
+    safe_id = _normalise_tracking_id(tracking_id)
+    if not safe_id:
+        return jsonify({"error": "Invalid tracking ID."}), 400
+
+    entries = db.filter_history(
+        safe_id,
+        start=request.args.get("start"),
+        end=request.args.get("end"),
+    )
+    if not entries:
+        return jsonify({"error": f"No history found for '{tracking_id}'."}), 404
+
+    return jsonify({
+        "tracking_id": safe_id,
+        "filters": {
+            "start": request.args.get("start"),
+            "end": request.args.get("end"),
+        },
+        "entries": entries,
+        "summary": _build_history_summary(entries),
+    })
+
+
+@app.route("/api/history/<tracking_id>/export", methods=["GET"])
+def api_history_export(tracking_id):
+    """Export the stored history for a tracking ID as CSV."""
+    safe_id = _normalise_tracking_id(tracking_id)
+    if not safe_id:
+        return jsonify({"error": "Invalid tracking ID."}), 400
+
+    entries = db.filter_history(
+        safe_id,
+        start=request.args.get("start"),
+        end=request.args.get("end"),
+    )
+    if not entries:
+        return jsonify({"error": f"No history found for '{tracking_id}'."}), 404
+
+    csv_text = _history_entries_to_csv(entries)
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="history_{safe_id}.csv"',
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-trained model analysis — click a subject chip, get results
+# ---------------------------------------------------------------------------
+
+def _find_pkl(subject_id: str) -> str | None:
+    """Locate a .pkl file for *subject_id* across known directories.
+
+    Search order:
+      1. saved_files/<sid>.pkl
+      2. WESAD_DATA_DIR/<sid>/<sid>.pkl
+    Returns the path if found, else ``None``.
+    """
+    safe = secure_filename(subject_id)
+    # 1. saved uploads
+    p = os.path.join(SAVED_FILES_DIR, f"{safe}.pkl")
+    if os.path.isfile(p):
+        return p
+    # 2. WESAD raw dataset
+    p = os.path.join(WESAD_DATA_DIR, safe, f"{safe}.pkl")
+    if os.path.isfile(p):
+        return p
+    return None
+
+
+@app.route("/api/analyze-pretrained/<subject_id>", methods=["POST"])
+def api_analyze_pretrained(subject_id):
+    """Analyse a subject — serves saved results instantly when available.
+
+    Priority order:
+      1. In-memory prediction cache (fastest)
+      2. On-disk saved JSON result (survives restarts)
+      3. Model + cached features (re-predict)
+      4. Model + raw .pkl (extract + predict)
+    """
+    safe_id = secure_filename(subject_id)
+
+    try:
+        # 1. Instant path: in-memory cache
+        cached_result = _prediction_cache.get(safe_id)
+        if cached_result is not None:
+            return jsonify(cached_result)
+
+        # 2. Disk-saved result (from a previous upload/analysis)
+        disk_result = db.load_result(safe_id)
+        if disk_result is not None:
+            _prediction_cache[safe_id] = disk_result
+            return jsonify(disk_result)
+
+        # 3. Need a model to compute — check it exists
+        if not model_exists(safe_id):
+            return jsonify({
+                "error": f"No results or model found for '{subject_id}'. "
+                         "Please upload the .pkl file first.",
+            }), 404
+
+        model, scaler = None, None
+        X, y = None, None
+
+        # Fast path: cached features
+        if features_cache_exists(safe_id):
+            model, scaler = load_model(safe_id)
+            if model is not None:
+                X, y = load_features_cache(safe_id)
+
+        # Slow path: extract from pkl
+        if X is None:
+            pkl_path = _find_pkl(safe_id)
+            if pkl_path is None:
+                return jsonify({
+                    "error": f"No data found for '{subject_id}'. "
+                             "Please upload the .pkl file once so results can be saved.",
+                }), 404
+            features, labels = load_subject(pkl_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(safe_id, X, y)
+
+        if model is None:
+            model, scaler = load_model(safe_id)
+            if model is None:
+                invalidate_model_cache(safe_id)
+                return jsonify({
+                    "error": f"Model for '{subject_id}' is outdated. "
+                             "Please re-upload the .pkl file to retrain.",
+                }), 500
+
+        results = predict(model, scaler, X)
+        ctx = _build_result_dict(safe_id, "pre-trained", results)
+        # Persist to memory + disk
+        _prediction_cache[safe_id] = ctx
+        db.save_result(safe_id, ctx)
+        return jsonify(ctx)
+
+    except Exception as exc:
+        logger.exception("Error analysing pretrained subject")
+        return jsonify({"error": f"Error processing: {exc}"}), 500
+
+
+@app.route("/api/compare-pretrained/<subject_id>", methods=["POST"])
+def api_compare_pretrained(subject_id):
+    """Compare all classifiers for a subject with a pre-trained model."""
+    rl = _check_rate_limit()
+    if rl:
+        return rl
+    safe_id = secure_filename(subject_id)
+
+    try:
+        cached = _get_cached_comparison(safe_id)
+        if cached is not None:
+            return jsonify({"subject_id": safe_id, "results": cached})
+
+        X, y = load_features_cache(safe_id)
+        if X is None:
+            pkl_path = _find_pkl(safe_id)
+            if pkl_path is None:
+                return jsonify({
+                    "error": f"Feature cache not found for '{subject_id}'. "
+                             "Please upload the .pkl file once so features can be cached.",
+                }), 404
+            features, labels = load_subject(pkl_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(safe_id, X, y)
+
+        results = compare_classifiers(X, y, cv_folds=5, verbose=True)
+        _set_cached_comparison(safe_id, results)
+        return jsonify({"subject_id": safe_id, "results": results})
+
+    except Exception as exc:
+        logger.exception("Error during pretrained comparison")
+        return jsonify({"error": f"Error during model comparison: {exc}"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Saved-files endpoints — upload once, analyse many times
+# ---------------------------------------------------------------------------
+
+@app.route("/api/saved-files", methods=["GET"])
+def api_saved_files():
+    """Return a list of previously saved .pkl files."""
+    files = []
+    if os.path.isdir(SAVED_FILES_DIR):
+        for fname in sorted(os.listdir(SAVED_FILES_DIR)):
+            if fname.endswith(".pkl"):
+                fpath = os.path.join(SAVED_FILES_DIR, fname)
+                sid = os.path.splitext(fname)[0]
+                files.append({
+                    "filename": fname,
+                    "subject_id": sid,
+                    "size_mb": round(os.path.getsize(fpath) / (1024 * 1024), 1),
+                    "has_model": model_exists(sid),
+                    "has_cache": features_cache_exists(sid),
+                })
+    return jsonify({"files": files})
+
+
+@app.route("/api/analyze/<subject_id>", methods=["POST"])
+def api_analyze_saved(subject_id):
+    """Analyse a previously saved .pkl file by subject_id (no upload needed)."""
+    safe_id = secure_filename(subject_id)
+    pkl_path = os.path.join(SAVED_FILES_DIR, f"{safe_id}.pkl")
+    if not os.path.isfile(pkl_path):
+        return jsonify({"error": f"No saved file for '{subject_id}'."}), 404
+
+    try:
+        # Instant path: return pre-computed result from memory/disk cache
+        cached_result = _prediction_cache.get(safe_id)
+        if cached_result is not None:
+            return jsonify(cached_result)
+        disk_result = db.load_result(safe_id)
+        if disk_result is not None:
+            _prediction_cache[safe_id] = disk_result
+            return jsonify(disk_result)
+
+        model, scaler, metrics = None, None, None
+        X, y = None, None
+
+        if model_exists(safe_id) and features_cache_exists(safe_id):
+            model, scaler = load_model(safe_id)
+            if model is not None:
+                X, y = load_features_cache(safe_id)
+
+        if X is None:
+            features, labels = load_subject(pkl_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(safe_id, X, y)
+
+        if model is None:
+            if model_exists(safe_id):
+                model, scaler = load_model(safe_id)
+                if model is None:
+                    invalidate_model_cache(safe_id)
+
+        if model is None:
+            model, scaler, metrics = train_model(X, y, cv_folds=5, verbose=True)
+            save_model(model, scaler, safe_id)
+
+        results = predict(model, scaler, X)
+        method = "pre-trained" if metrics is None else "trained on-the-fly"
+        ctx = _build_result_dict(safe_id, method, results, metrics=metrics)
+        # Persist to memory + disk
+        _prediction_cache[safe_id] = ctx
+        db.save_result(safe_id, ctx)
+        return jsonify(ctx)
+
+    except Exception as exc:
+        logger.exception("Error analysing saved file")
+        return jsonify({"error": f"Error processing file: {exc}"}), 500
+
+
+@app.route("/api/compare-saved/<subject_id>", methods=["POST"])
+def api_compare_saved(subject_id):
+    """Compare classifiers on a previously saved .pkl file."""
+    rl = _check_rate_limit()
+    if rl:
+        return rl
+    safe_id = secure_filename(subject_id)
+    pkl_path = os.path.join(SAVED_FILES_DIR, f"{safe_id}.pkl")
+    if not os.path.isfile(pkl_path):
+        return jsonify({"error": f"No saved file for '{subject_id}'."}), 404
+
+    try:
+        cached = _get_cached_comparison(safe_id)
+        if cached is not None:
+            return jsonify({"subject_id": safe_id, "results": cached})
+
+        X, y = load_features_cache(safe_id)
+        if X is None:
+            features, labels = load_subject(pkl_path)
+            X, y = extract_windows(features, labels)
+            np.nan_to_num(X, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            save_features_cache(safe_id, X, y)
+
+        results = compare_classifiers(X, y, cv_folds=5, verbose=True)
+        _set_cached_comparison(safe_id, results)
+        return jsonify({"subject_id": safe_id, "results": results})
+
+    except Exception as exc:
+        logger.exception("Error during comparison of saved file")
+        return jsonify({"error": f"Error during model comparison: {exc}"}), 500
+
+
+@app.route("/api/saved-files/<subject_id>", methods=["DELETE"])
+def api_delete_saved(subject_id):
+    """Delete a saved .pkl file, cached features, and saved results."""
+    safe_id = secure_filename(subject_id)
+    pkl_path = os.path.join(SAVED_FILES_DIR, f"{safe_id}.pkl")
+    if not os.path.isfile(pkl_path):
+        return jsonify({"error": f"No saved file for '{subject_id}'."}), 404
+    os.remove(pkl_path)
+    # Also clean up saved results
+    _prediction_cache.pop(safe_id, None)
+    db.delete_result(safe_id)
+    return jsonify({"deleted": safe_id})
+
+
 @app.errorhandler(413)
 def request_entity_too_large(error):
-    return jsonify({"error": "File too large. Maximum upload size is 2 GB."}), 413
+    return jsonify({"error": "File too large. Maximum upload size is 200 MB."}), 413
 
 
 if __name__ == "__main__":
     _ensure_general_model()
+    _warmup_cache()
     app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1",
             host="127.0.0.1", port=5000, use_reloader=False)

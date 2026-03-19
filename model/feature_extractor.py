@@ -3,6 +3,7 @@
 Features include:
 - Time-domain: mean, std, min, max, median, IQR, skewness, kurtosis
 - Frequency-domain: dominant frequency, spectral energy, spectral entropy
+- HRV features: RMSSD, SDNN, mean RR, pNN50, HR (from ECG R-peaks)
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from typing import Any
 import numpy as np
 from scipy import stats as sp_stats
 from scipy.fft import rfft, rfftfreq
+from scipy.signal import find_peaks
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,7 @@ STRESS_LABELS: set[int] = {2}
 # Feature names (useful for labelling / importance charts)
 _TIME_STATS = ["mean", "std", "min", "max", "median", "iqr", "skew", "kurtosis"]
 _FREQ_STATS = ["dom_freq", "spectral_energy", "spectral_entropy"]
+_HRV_STATS = ["hrv_rmssd", "hrv_sdnn", "hrv_mean_rr", "hrv_pnn50", "hrv_hr"]
 
 CHANNEL_NAMES: list[str] = [
     "Chest Acc X", "Chest Acc Y", "Chest Acc Z",
@@ -43,10 +46,67 @@ CHANNEL_NAMES: list[str] = [
     "Wrist BVP", "Wrist EDA", "Wrist Temp",
 ]
 
+N_HRV_FEATURES = len(_HRV_STATS)
+
 FEATURE_NAMES: list[str] = (
     [f"{ch}_{stat}" for stat in _TIME_STATS for ch in CHANNEL_NAMES]
     + [f"{ch}_{stat}" for stat in _FREQ_STATS for ch in CHANNEL_NAMES]
+    + [f"ECG_{stat}" for stat in _HRV_STATS]
 )
+
+
+# ---------------------------------------------------------------------------
+# HRV feature helpers
+# ---------------------------------------------------------------------------
+
+def _compute_hrv_features_single(ecg_window: np.ndarray, fs: int = FS) -> np.ndarray:
+    """Extract 5 HRV features from a single ECG window.
+
+    Returns [RMSSD, SDNN, mean_RR, pNN50, HR].
+    """
+    # Simple R-peak detection: find peaks with minimum distance
+    min_distance = int(0.3 * fs)  # min 300 ms between beats (~200 bpm max)
+    # Use a height threshold at the 70th percentile of the signal
+    threshold = np.percentile(ecg_window, 70)
+    peaks, _ = find_peaks(ecg_window, distance=min_distance, height=threshold)
+
+    if len(peaks) < 2:
+        return np.zeros(N_HRV_FEATURES, dtype=np.float32)
+
+    # RR intervals in milliseconds
+    rr = np.diff(peaks) / fs * 1000.0
+
+    # Filter physiologically plausible RR intervals (300–1500 ms = 40–200 bpm)
+    rr = rr[(rr > 300) & (rr < 1500)]
+    if len(rr) < 2:
+        return np.zeros(N_HRV_FEATURES, dtype=np.float32)
+
+    rr_diff = np.diff(rr)
+    rmssd = np.sqrt(np.mean(rr_diff ** 2))
+    sdnn = np.std(rr, ddof=1) if len(rr) > 1 else 0.0
+    mean_rr = np.mean(rr)
+    pnn50 = np.sum(np.abs(rr_diff) > 50.0) / len(rr_diff) * 100.0 if len(rr_diff) > 0 else 0.0
+    hr = 60000.0 / mean_rr if mean_rr > 0 else 0.0
+
+    return np.array([rmssd, sdnn, mean_rr, pnn50, hr], dtype=np.float32)
+
+
+def _batch_hrv_features(windows: np.ndarray, fs: int = FS) -> np.ndarray:
+    """Compute HRV features for all windows. ECG is channel index 3.
+
+    Parameters
+    ----------
+    windows : np.ndarray of shape (n_windows, window_size, n_channels)
+
+    Returns
+    -------
+    np.ndarray of shape (n_windows, N_HRV_FEATURES)
+    """
+    n_windows = windows.shape[0]
+    hrv = np.zeros((n_windows, N_HRV_FEATURES), dtype=np.float32)
+    for i in range(n_windows):
+        hrv[i] = _compute_hrv_features_single(windows[i, :, 3], fs=fs)
+    return hrv
 
 
 def _spectral_features(window: np.ndarray, fs: int = FS) -> np.ndarray:
@@ -54,30 +114,29 @@ def _spectral_features(window: np.ndarray, fs: int = FS) -> np.ndarray:
 
     Returns array of shape (3 * n_channels,): [dom_freq..., energy..., entropy...].
     """
-    n_channels = window.shape[1]
-    dom_freqs = np.zeros(n_channels, dtype=np.float32)
-    energies = np.zeros(n_channels, dtype=np.float32)
-    entropies = np.zeros(n_channels, dtype=np.float32)
-
+    # Vectorised: FFT all channels at once (axis=0 operates along samples)
+    fft_vals = np.abs(rfft(window, axis=0))  # (freq_bins, n_channels)
     freqs = rfftfreq(window.shape[0], d=1.0 / fs)
 
-    for ch in range(n_channels):
-        fft_vals = np.abs(rfft(window[:, ch]))
-        # Dominant frequency
-        dom_freqs[ch] = freqs[np.argmax(fft_vals[1:])] if len(fft_vals) > 1 else 0.0
-        # Spectral energy
-        energies[ch] = np.sum(fft_vals ** 2)
-        # Spectral entropy
-        psd = fft_vals ** 2
-        psd_sum = psd.sum()
-        if psd_sum > 0:
-            psd_norm = psd / psd_sum
-            psd_norm = psd_norm[psd_norm > 0]
-            entropies[ch] = -np.sum(psd_norm * np.log2(psd_norm))
-        else:
-            entropies[ch] = 0.0
+    # Dominant frequency (skip DC at index 0)
+    if fft_vals.shape[0] > 1:
+        dom_freqs = freqs[np.argmax(fft_vals[1:], axis=0) + 1]
+    else:
+        dom_freqs = np.zeros(window.shape[1], dtype=np.float32)
 
-    return np.concatenate([dom_freqs, energies, entropies])
+    # Spectral energy
+    psd = fft_vals ** 2
+    energies = psd.sum(axis=0)
+
+    # Spectral entropy
+    psd_sum = psd.sum(axis=0, keepdims=True)
+    safe_sum = np.where(psd_sum == 0, 1.0, psd_sum)
+    psd_norm = psd / safe_sum
+    log_psd = np.where(psd_norm > 0, np.log2(psd_norm), 0.0)
+    entropies = -np.sum(psd_norm * log_psd, axis=0)
+    entropies = np.where(psd_sum.squeeze() == 0, 0.0, entropies)
+
+    return np.concatenate([dom_freqs, energies, entropies]).astype(np.float32)
 
 
 def compute_window_features(window: np.ndarray, fs: int = FS) -> np.ndarray:
@@ -94,7 +153,8 @@ def compute_window_features(window: np.ndarray, fs: int = FS) -> np.ndarray:
     np.ndarray
         1-D array of features:
         Time-domain (8 stats x 14 channels = 112) +
-        Frequency-domain (3 stats x 14 channels = 42) = 154 total.
+        Frequency-domain (3 stats x 14 channels = 42) +
+        HRV features (5) = 159 total.
     """
     time_feats = np.concatenate([
         np.mean(window, axis=0),
@@ -107,11 +167,90 @@ def compute_window_features(window: np.ndarray, fs: int = FS) -> np.ndarray:
         sp_stats.kurtosis(window, axis=0),
     ])
     freq_feats = _spectral_features(window, fs=fs)
-    feats = np.concatenate([time_feats, freq_feats]).astype(np.float32)
+    hrv_feats = _compute_hrv_features_single(window[:, 3], fs=fs)
+    feats = np.concatenate([time_feats, freq_feats, hrv_feats]).astype(np.float32)
     # Sanitise: replace NaN / Inf that can arise from constant-value
     # channels (skew, kurtosis) or degenerate FFT windows.
     np.nan_to_num(feats, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
     return feats
+
+
+def _batch_spectral_features(windows: np.ndarray, fs: int = FS) -> np.ndarray:
+    """Compute spectral features for ALL windows at once (fully vectorised).
+
+    Parameters
+    ----------
+    windows : np.ndarray of shape (n_windows, window_size, n_channels)
+
+    Returns
+    -------
+    np.ndarray of shape (n_windows, 3 * n_channels)
+    """
+    # FFT along the time axis for every window & channel simultaneously
+    # scipy.fft with workers=-1 uses all CPU cores via pocketfft threading
+    fft_vals = np.abs(rfft(windows, axis=1, workers=-1))  # (n_windows, freq_bins, n_channels)
+    freqs = rfftfreq(windows.shape[1], d=1.0 / fs)
+
+    # Dominant frequency (skip DC at index 0)
+    dom_idx = np.argmax(fft_vals[:, 1:, :], axis=1)  # (n_windows, n_channels)
+    dom_freqs = freqs[dom_idx + 1]
+
+    # Spectral energy
+    psd = fft_vals ** 2
+    energies = psd.sum(axis=1)  # (n_windows, n_channels)
+
+    # Spectral entropy
+    psd_sum = psd.sum(axis=1, keepdims=True)  # (n_windows, 1, n_channels)
+    safe_sum = np.where(psd_sum == 0, 1.0, psd_sum)
+    psd_norm = psd / safe_sum
+    log_psd = np.where(psd_norm > 0, np.log2(psd_norm), 0.0)
+    entropies = -np.sum(psd_norm * log_psd, axis=1)  # (n_windows, n_channels)
+    entropies = np.where(psd_sum.squeeze(axis=1) == 0, 0.0, entropies)
+
+    return np.concatenate([dom_freqs, energies, entropies], axis=1).astype(np.float32)
+
+
+def _batch_compute_features(windows: np.ndarray, fs: int = FS) -> np.ndarray:
+    """Compute all features for every window in one vectorised pass.
+
+    Parameters
+    ----------
+    windows : np.ndarray of shape (n_windows, window_size, n_channels)
+
+    Returns
+    -------
+    np.ndarray of shape (n_windows, 159)
+    """
+    # --- Time-domain stats (all windows at once) ---
+    means = np.mean(windows, axis=1)
+    stds = np.std(windows, axis=1)
+    mins = np.min(windows, axis=1)
+    maxs = np.max(windows, axis=1)
+
+    # Single quantile call for median + IQR (much faster than separate calls)
+    quantiles = np.quantile(windows, [0.25, 0.5, 0.75], axis=1)
+    medians = quantiles[1]
+    iqrs = quantiles[2] - quantiles[0]
+
+    # Manual skew & kurtosis from moments (avoids slow scipy.stats overhead)
+    centered = windows - means[:, np.newaxis, :]
+    safe_std = np.where(stds == 0, 1.0, stds)
+    skews = np.mean(centered ** 3, axis=1) / (safe_std ** 3)
+    kurts = np.mean(centered ** 4, axis=1) / (safe_std ** 4) - 3.0
+
+    time_feats = np.concatenate(
+        [means, stds, mins, maxs, medians, iqrs, skews, kurts], axis=1,
+    )
+
+    # --- Frequency-domain stats (all windows at once) ---
+    freq_feats = _batch_spectral_features(windows, fs=fs)
+
+    # --- HRV features from ECG (channel 3) ---
+    hrv_feats = _batch_hrv_features(windows, fs=fs)
+
+    features = np.concatenate([time_feats, freq_feats, hrv_feats], axis=1).astype(np.float32)
+    np.nan_to_num(features, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return features
 
 
 def extract_windows(
@@ -119,6 +258,7 @@ def extract_windows(
     labels: np.ndarray,
     window_sec: float = DEFAULT_WINDOW_SEC,
     fs: int = FS,
+    overlap: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Segment raw sample-level data into labelled windows.
 
@@ -130,6 +270,10 @@ def extract_windows(
         Window size in seconds.
     fs : int
         Sampling frequency.
+    overlap : float
+        Fraction of overlap between consecutive windows (0.0–0.99).
+        Default 0.5 (50%) doubles training data and preserves temporal
+        continuity. Set to 0.0 for legacy non-overlapping behaviour.
 
     Returns
     -------
@@ -138,30 +282,43 @@ def extract_windows(
     y : np.ndarray of shape (n_windows,)
         Majority-vote label per window.
     """
+    overlap = max(0.0, min(overlap, 0.99))
     window_size = int(window_sec * fs)
+    step_size = max(1, int(window_size * (1 - overlap)))
     n_samples = len(features)
-    n_windows = n_samples // window_size
 
-    X_list: list[np.ndarray] = []
-    y_list: list[int] = []
+    if n_samples < window_size:
+        return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), np.empty(0, dtype=np.int64)
 
-    for i in range(n_windows):
-        start = i * window_size
-        end = start + window_size
-        win_feat = features[start:end]
-        win_label = labels[start:end]
+    # Build overlapping windows using stride tricks for zero-copy views
+    n_windows = (n_samples - window_size) // step_size + 1
 
-        # Majority-vote label across the window
-        if len(win_label) == 0:
-            continue
-        values, counts = np.unique(win_label, return_counts=True)
-        majority = int(values[np.argmax(counts)])
+    if n_windows == 0:
+        return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32), np.empty(0, dtype=np.int64)
 
-        X_list.append(compute_window_features(win_feat, fs=fs))
-        y_list.append(majority)
+    # Collect window start indices
+    starts = np.arange(n_windows) * step_size
 
-    logger.info("Extracted %d windows (%ds each @ %d Hz).", len(X_list), window_sec, fs)
-    return np.array(X_list, dtype=np.float32), np.array(y_list, dtype=np.int64)
+    # Fancy-index into feature and label arrays
+    idx = starts[:, np.newaxis] + np.arange(window_size)[np.newaxis, :]
+    windows = features[idx]                    # (n_windows, window_size, n_channels)
+    label_windows = labels[idx]                # (n_windows, window_size)
+
+    # Majority-vote labels — fully vectorised (labels are 1, 2, 3)
+    max_label = int(label_windows.max()) + 1
+    counts = np.zeros((n_windows, max_label), dtype=np.int32)
+    for lbl in np.unique(label_windows):
+        counts[:, lbl] = np.sum(label_windows == lbl, axis=1)
+    y = np.argmax(counts, axis=1).astype(np.int64)
+
+    # Batch-compute all 159 features for every window at once
+    X = _batch_compute_features(windows, fs=fs)
+
+    logger.info(
+        "Extracted %d windows (%ds each, %.0f%% overlap @ %d Hz).",
+        n_windows, window_sec, overlap * 100, fs,
+    )
+    return X, y
 
 
 def features_from_manual_input(sensor_values: dict[str, float]) -> np.ndarray:
@@ -207,7 +364,9 @@ def features_from_manual_input(sensor_values: dict[str, float]) -> np.ndarray:
     ])
     # Frequency-domain: dom_freq=0, energy=0, entropy=0
     freq_feats = np.concatenate([zeros, zeros, zeros])
-    feats = np.concatenate([time_feats, freq_feats])
+    # HRV: synthesise plausible resting values from manual input
+    hrv_feats = np.array([30.0, 50.0, 800.0, 20.0, 75.0], dtype=np.float32)
+    feats = np.concatenate([time_feats, freq_feats, hrv_feats])
     return feats.reshape(1, -1)
 
 

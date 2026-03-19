@@ -54,29 +54,41 @@ def test_extract_chest_data_shape():
 def test_compute_window_features():
     window = np.ones((50, 14), dtype=np.float32)
     feats = compute_window_features(window)
-    # 8 time-domain stats * 14 channels + 3 freq-domain stats * 14 channels = 154
-    assert feats.shape == (154,)
+    # 8 time-domain stats * 14 channels + 3 freq-domain stats * 14 channels + 5 HRV = 159
+    assert feats.shape == (159,)
     # mean should be 1, std 0 for the time-domain part
     np.testing.assert_allclose(feats[:14], 1.0)
     np.testing.assert_allclose(feats[14:28], 0.0, atol=1e-6)
 
 
 def test_extract_windows_basic():
-    n = 7000  # 10 windows at window_sec=1, fs=700
+    n = 7000  # with 50% overlap at window_sec=1, fs=700 -> ~19 windows
     features = np.random.randn(n, 14).astype(np.float32)
     labels = np.ones(n, dtype=np.int64)
     labels[:3500] = 2  # First half stressed
 
     X, y = extract_windows(features, labels, window_sec=1, fs=700)
+    assert X.shape[0] >= 10  # at least 10 windows (overlap produces more)
+    assert X.shape[1] == 159
+    assert y.shape[0] == X.shape[0]
+
+
+def test_extract_windows_no_overlap():
+    """Legacy non-overlapping mode still works."""
+    n = 7000
+    features = np.random.randn(n, 14).astype(np.float32)
+    labels = np.ones(n, dtype=np.int64)
+    labels[:3500] = 2
+
+    X, y = extract_windows(features, labels, window_sec=1, fs=700, overlap=0.0)
     assert X.shape[0] == 10
-    assert X.shape[1] == 154
-    assert y.shape[0] == 10
+    assert X.shape[1] == 159
 
 
 def test_features_from_manual_input():
     vals = {col: float(i) for i, col in enumerate(FEATURE_COLUMNS)}
     X = features_from_manual_input(vals)
-    assert X.shape == (1, 154)
+    assert X.shape == (1, 159)
     # mean part should equal ordered values
     expected = np.arange(14, dtype=np.float32)
     np.testing.assert_allclose(X[0, :14], expected)
@@ -92,7 +104,7 @@ def test_features_from_manual_input_means_only():
 
 def test_feature_names_length():
     """FEATURE_NAMES should match the total feature count."""
-    assert len(FEATURE_NAMES) == 154
+    assert len(FEATURE_NAMES) == 159
 
 
 def test_label_map_contains_stress():
@@ -106,7 +118,7 @@ def test_label_map_contains_stress():
 
 def test_train_model_returns_metrics():
     from model.trainer import train_model
-    X = np.random.randn(200, 154).astype(np.float32)
+    X = np.random.randn(200, 159).astype(np.float32)
     y = np.random.choice([1, 2, 3], size=200).astype(np.int64)
     clf, scaler, metrics = train_model(X, y, cv_folds=2, verbose=False)
     assert "accuracy" in metrics
@@ -115,11 +127,13 @@ def test_train_model_returns_metrics():
     assert "train_time_sec" in metrics
     assert "classifier_name" in metrics
     assert metrics["classifier_name"] == "Random Forest"
+    assert "roc_auc" in metrics
+    assert "n_features_used" in metrics
 
 
 def test_compare_classifiers_returns_sorted():
     from model.trainer import compare_classifiers
-    X = np.random.randn(200, 154).astype(np.float32)
+    X = np.random.randn(200, 159).astype(np.float32)
     y = np.random.choice([1, 2, 3], size=200).astype(np.int64)
     results = compare_classifiers(
         X, y, cv_folds=2,
@@ -133,13 +147,14 @@ def test_compare_classifiers_returns_sorted():
 
 def test_train_model_svm():
     from model.trainer import train_model
-    X = np.random.randn(200, 154).astype(np.float32)
+    X = np.random.randn(200, 159).astype(np.float32)
     y = np.random.choice([1, 2, 3], size=200).astype(np.int64)
     clf, scaler, metrics = train_model(
         X, y, cv_folds=0, classifier_name="SVM",
     )
     assert metrics["classifier_name"] == "SVM"
     assert metrics["accuracy"] > 0
+    assert "roc_auc" in metrics
 
 
 def test_train_general_model():
@@ -264,30 +279,178 @@ def test_api_models():
     assert isinstance(data["models"], list)
 
 
+def test_api_predict_tracking_history(monkeypatch):
+    import app as app_module
+    import database as db_module
+
+    tracking_id = "TRACK_TEST"
+    # Clean any leftover history rows
+    conn = db_module.get_connection()
+    conn.execute("DELETE FROM history WHERE tracking_id = ?", (tracking_id,))
+    conn.commit()
+
+    monkeypatch.setattr(app_module, "general_model_exists", lambda: True)
+    monkeypatch.setattr(app_module, "load_manual_model", lambda: (object(), object()))
+
+    def fake_predict(_model, _scaler, X):
+        stressed = float(X[0, 0]) >= 1.0
+        label = "Stress" if stressed else "Baseline"
+        return {
+            "predictions": [2 if stressed else 1],
+            "label_names": [label],
+            "is_stressed": [stressed],
+            "stress_ratio": 1.0 if stressed else 0.0,
+            "stress_confidence": 0.85 if stressed else 0.15,
+        }
+
+    monkeypatch.setattr(app_module, "predict", fake_predict)
+
+    client = app_module.app.test_client()
+
+    try:
+        resp1 = client.post(
+            "/api/predict",
+            data=json.dumps({
+                "tracking_id": tracking_id,
+                "sensors": {"Chest Acc X": 0.0},
+            }),
+            content_type="application/json",
+        )
+        assert resp1.status_code == 200
+        first = resp1.get_json()
+        assert first["tracking_id"] == tracking_id
+        assert first["history_length"] == 1
+
+        resp2 = client.post(
+            "/api/predict",
+            data=json.dumps({
+                "tracking_id": tracking_id,
+                "sensors": {"Chest Acc X": 1.0},
+            }),
+            content_type="application/json",
+        )
+        assert resp2.status_code == 200
+        second = resp2.get_json()
+        assert second["history_length"] == 2
+
+        history_resp = client.get(f"/api/history/{tracking_id}")
+        assert history_resp.status_code == 200
+        history = history_resp.get_json()
+        assert history["tracking_id"] == tracking_id
+        assert len(history["entries"]) == 2
+        assert history["summary"]["count"] == 2
+        assert history["summary"]["delta"] > 0
+    finally:
+        conn = db_module.get_connection()
+        conn.execute("DELETE FROM history WHERE tracking_id = ?", (tracking_id,))
+        conn.commit()
+
+
+def test_api_history_filter_and_export():
+    import app as app_module
+    import database as db_module
+
+    tracking_id = "TRACK_FILTER"
+    # Clean any leftover rows
+    conn = db_module.get_connection()
+    conn.execute("DELETE FROM history WHERE tracking_id = ?", (tracking_id,))
+    conn.commit()
+
+    entries = [
+        {
+            "tracking_id": tracking_id,
+            "captured_at": "2026-03-16T09:00:00Z",
+            "subject_id": "Manual (general model)",
+            "method": "manual input",
+            "is_manual": True,
+            "stress_ratio": 0.15,
+            "stress_level": "Low Stress",
+            "overall_stress": False,
+            "predicted_label": "Baseline",
+            "total_windows": 1,
+            "label_counts": {"Baseline": 1},
+        },
+        {
+            "tracking_id": tracking_id,
+            "captured_at": "2026-03-17T12:00:00Z",
+            "subject_id": "Manual (general model)",
+            "method": "manual input",
+            "is_manual": True,
+            "stress_ratio": 0.55,
+            "stress_level": "High Stress",
+            "overall_stress": True,
+            "predicted_label": "Stress",
+            "total_windows": 1,
+            "label_counts": {"Stress": 1},
+        },
+        {
+            "tracking_id": tracking_id,
+            "captured_at": "2026-03-18T18:30:00Z",
+            "subject_id": "Manual (general model)",
+            "method": "manual input",
+            "is_manual": True,
+            "stress_ratio": 0.35,
+            "stress_level": "Moderate Stress",
+            "overall_stress": True,
+            "predicted_label": "Stress",
+            "total_windows": 1,
+            "label_counts": {"Stress": 1},
+        },
+    ]
+    for entry in entries:
+        db_module.append_history_entry(tracking_id, entry)
+
+    client = app_module.app.test_client()
+
+    try:
+        filtered_resp = client.get(
+            f"/api/history/{tracking_id}?start=2026-03-17T00:00:00Z&end=2026-03-17T23:59:59Z"
+        )
+        assert filtered_resp.status_code == 200
+        filtered = filtered_resp.get_json()
+        assert len(filtered["entries"]) == 1
+        assert filtered["entries"][0]["captured_at"] == "2026-03-17T12:00:00Z"
+
+        csv_resp = client.get(
+            f"/api/history/{tracking_id}/export?format=csv&start=2026-03-17T00:00:00Z"
+        )
+        assert csv_resp.status_code == 200
+        assert csv_resp.mimetype == "text/csv"
+        csv_text = csv_resp.get_data(as_text=True)
+        assert "tracking_id,captured_at,subject_id" in csv_text
+        assert "2026-03-17T12:00:00Z" in csv_text
+        assert "2026-03-16T09:00:00Z" not in csv_text
+    finally:
+        conn = db_module.get_connection()
+        conn.execute("DELETE FROM history WHERE tracking_id = ?", (tracking_id,))
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: create a fake .pkl, upload via API, get JSON results
 # ---------------------------------------------------------------------------
 
 def _make_fake_pkl(path, duration_sec=10):
     """Create a minimal WESAD-like .pkl file for testing."""
+    rng = np.random.RandomState(42)  # deterministic for reproducible tests
     n_chest = duration_sec * 700
     # Ensure balanced labels so stratified split always works
     labels = np.tile([1, 2, 3], n_chest // 3 + 1)[:n_chest].astype(np.int64)
     data = {
         "signal": {
             "chest": {
-                "ACC": np.random.randn(n_chest, 3).astype(np.float32),
-                "ECG": np.random.randn(n_chest, 1).astype(np.float32),
-                "EMG": np.random.randn(n_chest, 1).astype(np.float32),
-                "EDA": np.random.randn(n_chest, 1).astype(np.float32),
-                "Temp": np.random.randn(n_chest, 1).astype(np.float32),
-                "Resp": np.random.randn(n_chest, 1).astype(np.float32),
+                "ACC": rng.randn(n_chest, 3).astype(np.float32),
+                "ECG": rng.randn(n_chest, 1).astype(np.float32),
+                "EMG": rng.randn(n_chest, 1).astype(np.float32),
+                "EDA": rng.randn(n_chest, 1).astype(np.float32),
+                "Temp": rng.randn(n_chest, 1).astype(np.float32),
+                "Resp": rng.randn(n_chest, 1).astype(np.float32),
             },
             "wrist": {
-                "ACC": np.random.randn(duration_sec * 32, 3).astype(np.float32),
-                "BVP": np.random.randn(duration_sec * 64, 1).astype(np.float32),
-                "EDA": np.random.randn(duration_sec * 4, 1).astype(np.float32),
-                "TEMP": np.random.randn(duration_sec * 4, 1).astype(np.float32),
+                "ACC": rng.randn(duration_sec * 32, 3).astype(np.float32),
+                "BVP": rng.randn(duration_sec * 64, 1).astype(np.float32),
+                "EDA": rng.randn(duration_sec * 4, 1).astype(np.float32),
+                "TEMP": rng.randn(duration_sec * 4, 1).astype(np.float32),
             },
         },
         "label": labels,
@@ -324,10 +487,19 @@ def test_end_to_end_upload():
     finally:
         os.unlink(tmp_path)
         # Clean up trained model artifacts
-        for f in ("model_TEST.joblib", "scaler_TEST.joblib"):
+        for f in ("model_TEST.joblib", "scaler_TEST.joblib", "features_TEST.npz"):
             p = os.path.join(os.path.dirname(__file__), "..", "trained_models", f)
             if os.path.exists(p):
                 os.unlink(p)
+        # Clean up saved file
+        sp = os.path.join(os.path.dirname(__file__), "..", "saved_files", "TEST.pkl")
+        if os.path.exists(sp):
+            os.unlink(sp)
+        # Clean up cached result in DB
+        import database as db_module
+        db_module.delete_result("TEST")
+        from app import _prediction_cache
+        _prediction_cache.pop("TEST", None)
 
 
 def test_end_to_end_compare():
@@ -352,14 +524,28 @@ def test_end_to_end_compare():
         result = resp.get_json()
         assert "subject_id" in result
         assert "results" in result
-        assert len(result["results"]) == 6  # 6 classifiers
+        assert len(result["results"]) >= 6  # 6 base + optional LightGBM
     finally:
         os.unlink(tmp_path)
         # Clean up trained model artifacts
-        for f in ("model_TEST.joblib", "scaler_TEST.joblib"):
+        for f in ("model_TEST.joblib", "scaler_TEST.joblib", "features_TEST.npz"):
             p = os.path.join(os.path.dirname(__file__), "..", "trained_models", f)
             if os.path.exists(p):
                 os.unlink(p)
+        # Clean up saved file
+        sp = os.path.join(os.path.dirname(__file__), "..", "saved_files", "TEST.pkl")
+        if os.path.exists(sp):
+            os.unlink(sp)
+        # Clean up cached result in DB
+        import database as db_module
+        db_module.delete_result("TEST")
+        # Clean up cached comparison in DB
+        conn = db_module.get_connection()
+        conn.execute("DELETE FROM comparisons WHERE subject_id = ?", ("TEST",))
+        conn.commit()
+        from app import _prediction_cache, _compare_cache
+        _prediction_cache.pop("TEST", None)
+        _compare_cache.pop("TEST", None)
 
 
 # ---------------------------------------------------------------------------
