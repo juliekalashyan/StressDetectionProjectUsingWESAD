@@ -1,5 +1,5 @@
 /* ==========================================================================
-   WESAD Stress Detection – SPA Client
+   StressAware – SPA Client
    No Jinja2 — all rendering done client-side via vanilla JS.
    ========================================================================== */
 
@@ -232,10 +232,22 @@
         }
         $manualBanner.style.display = '';
         loadSavedFiles();
+        if (cfg.max_upload_mb != null) {
+          var hint = document.querySelector('.drop-zone-hint');
+          if (hint) {
+            hint.textContent = 'Accepts .pkl files up to ' + formatUploadLimit(cfg.max_upload_mb);
+          }
+        }
         // Prefetch all pre-computed results for instant single-click access
         prefetchResults();
       })
       .catch(function (err) { showAlert('Failed to load configuration: ' + err); });
+  }
+
+  function formatUploadLimit(limitMb) {
+    if (!limitMb) return 'Unlimited';
+    if (limitMb >= 1024) return (limitMb / 1024).toFixed(0) + ' GB';
+    return limitMb + ' MB';
   }
 
   function prefetchResults() {
@@ -825,7 +837,7 @@
           '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg> Analyse Another' +
         '</button>' +
       '</div>' +
-      '<footer class="footer animate-in"><p>WESAD Stress Detection &middot; Machine Learning Pipeline</p>' +
+      '<footer class="footer animate-in"><p>StressAware &middot; Machine Learning Pipeline</p>' +
         '<div class="footer-links">' +
           '<a href="https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection" target="_blank" rel="noopener">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> WESAD Dataset</a>' +
@@ -1118,7 +1130,7 @@
       '<section class="card animate-in"><h2 class="section-title">Confusion Matrices</h2><div class="cm-grid">' + cmItems + '</div></section>' +
       '<div class="actions animate-in"><button class="btn btn-back" id="backBtnCompare">' +
         '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></svg> Back to Home</button></div>' +
-      '<footer class="footer animate-in"><p>WESAD Stress Detection &middot; Multi-Classifier Comparison</p>' +
+      '<footer class="footer animate-in"><p>StressAware &middot; Multi-Classifier Comparison</p>' +
         '<div class="footer-links">' +
           '<a href="https://archive.ics.uci.edu/dataset/465/wesad+wearable+stress+and+affect+detection" target="_blank" rel="noopener">' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> WESAD Dataset</a>' +

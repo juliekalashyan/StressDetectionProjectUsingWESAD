@@ -193,7 +193,7 @@ def test_flask_index():
     client = app.test_client()
     resp = client.get("/")
     assert resp.status_code == 200
-    assert b"WESAD Stress Detection" in resp.data
+    assert b"StressAware" in resp.data
 
 
 def test_api_config():
@@ -208,6 +208,8 @@ def test_api_config():
     assert "sensor_meta" in data
     assert "classifier_names" in data
     assert "general_model_ready" in data
+    assert "max_upload_mb" in data
+    assert isinstance(data["max_upload_mb"], int)
     assert isinstance(data["feature_columns"], list)
     assert len(data["feature_columns"]) == 14
 

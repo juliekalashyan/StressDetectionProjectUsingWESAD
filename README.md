@@ -1,4 +1,4 @@
-# WESAD Stress Detection — Full-Stack ML Web Application
+# StressAware — Full-Stack ML Web Application
 
 **Real-time physiological stress detection** using wearable sensor data from the [WESAD](https://archive.ics.uci.edu/ml/datasets/WESAD+%28Wearable+Stress+and+Affect+Detection%29) dataset.
 
@@ -100,7 +100,7 @@ Example: Clicking a pre-trained subject chip loads cached results from SQLite in
 ## Project Structure
 
 ```
-Project/
+StressAware/
 ├── app.py                       # Flask web server and REST API
 ├── database.py                  # SQLite layer for history, results, comparisons
 ├── train_model.py               # CLI for training and model comparison
@@ -579,7 +579,7 @@ FLASK_ENV=development  # or 'production'
 
 ### Issue: Out of memory when uploading large `.pkl` files
 
-**Solution:** Increase virtual memory or reduce window size (change `DEFAULT_WINDOW_SEC` in feature_extractor.py).
+**Solution:** Increase virtual memory or reduce window size (change `DEFAULT_WINDOW_SEC` in `model/feature_extractor.py`). The server default upload limit is 2 GB. You can also set a larger limit with the `MAX_UPLOAD_MB` environment variable or override the exact byte limit with `MAX_CONTENT_LENGTH` in `app.py`.
 
 ### Issue: Pre-trained models not loading
 

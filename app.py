@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flask web application for WESAD stress detection.
+"""Flask web application for StressAware stress detection.
 
 Serves a static SPA front-end and exposes JSON API endpoints.
 No Jinja2 templates — all rendering happens client-side.
@@ -56,11 +56,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB (largest WESAD .pkl ~170 MB)
+
+DEFAULT_MAX_UPLOAD_MB = 2048
+env_max_content = os.environ.get("MAX_CONTENT_LENGTH")
+if env_max_content is not None:
+    try:
+        app.config["MAX_CONTENT_LENGTH"] = int(env_max_content)
+    except ValueError:
+        app.config["MAX_CONTENT_LENGTH"] = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
+else:
+    env_max_upload_mb = os.environ.get("MAX_UPLOAD_MB")
+    if env_max_upload_mb is not None:
+        try:
+            app.config["MAX_CONTENT_LENGTH"] = int(env_max_upload_mb) * 1024 * 1024
+        except ValueError:
+            app.config["MAX_CONTENT_LENGTH"] = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
+    else:
+        app.config["MAX_CONTENT_LENGTH"] = DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
 
 UPLOAD_FOLDER = os.path.join(tempfile.gettempdir(), "wesad_uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+logger.info("Effective upload max content length: %s", app.config["MAX_CONTENT_LENGTH"])
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +519,9 @@ def api_config():
         set(subjects) | set(_prediction_cache.keys()),
         key=lambda s: [int(t) if t.isdigit() else t for t in __import__('re').split(r'(\d+)', s)],
     )
+    max_upload_mb = None
+    if app.config["MAX_CONTENT_LENGTH"] is not None:
+        max_upload_mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
     return jsonify({
         "feature_columns": FEATURE_COLUMNS,
         "subjects": result_subjects,
@@ -511,6 +531,7 @@ def api_config():
         "classifier_names": list(CLASSIFIER_CATALOGUE.keys()),
         "sensor_meta": SENSOR_META,
         "general_model_ready": general_model_exists() and general_manual_model_exists(),
+        "max_upload_mb": max_upload_mb,
     })
 
 
@@ -1052,10 +1073,19 @@ def api_delete_saved(subject_id):
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
-    return jsonify({"error": "File too large. Maximum upload size is 200 MB."}), 413
+    max_content = app.config["MAX_CONTENT_LENGTH"]
+    if max_content is None:
+        limit_desc = "unlimited"
+    else:
+        limit_mb = max_content // (1024 * 1024)
+        limit_desc = f"{limit_mb} MB" if limit_mb < 1024 else f"{limit_mb // 1024} GB"
+    return jsonify({"error": f"File too large. Maximum upload size is {limit_desc}."}), 413
 
 
 if __name__ == "__main__":
+
+
+
     _ensure_general_model()
     _warmup_cache()
     app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1",
